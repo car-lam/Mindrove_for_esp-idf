@@ -1,5 +1,6 @@
 /*
 This component establishes connection with and samples data from the Mindrove Armband.
+The execution of this component will stop any other wifi connection
 */
 
 #ifndef MINDROVE_DRIVER_H
@@ -26,7 +27,7 @@ typedef struct{
 } mr_data_log_t;
 
 // Start connection. This function will verify whether the wifi connection has been already established, and, if not, it will.
-esp_err_t mr_connection_init (const char *mr_wifi_ssid, const char *mr_wifi_pass, TickType_t ticks_to_wait);
+esp_err_t mr_connect (const char *mr_wifi_ssid, const char *mr_wifi_pass, TickType_t ticks_to_wait);
 
 // Starts a task that gets data continuously
 esp_err_t mr_get_data_start (void);
