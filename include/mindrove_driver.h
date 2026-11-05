@@ -3,12 +3,13 @@ This component establishes connection with and samples data from the Mindrove Ar
 The execution of this component will stop any other wifi connection
 */
 
+
 #ifndef MINDROVE_DRIVER_H
 #define MINDROVE_DRIVER_H
 
 #include <stdint.h>
 #include "esp_err.h"
-#include "freertos/FreeRTOS.h"
+#include "freertos/FreeRTOS.h" // IWYU pragma: keep
 
 #define MR_N_SAMP_PER_PACK_EMG 2 // EMG samples per data package
 #define MR_N_EMG_CHANNELS 8 // number of EMG channels on Mindrove Armband
@@ -30,19 +31,12 @@ typedef struct{
 esp_err_t mr_connect (const char *mr_wifi_ssid, const char *mr_wifi_pass, TickType_t ticks_to_wait);
 
 // Starts a task that gets data continuously
-esp_err_t mr_get_data_start (void);
+// This function calls mr_get_data once the buffer is full so the user only works with complete buffers
+esp_err_t mr_get_data_start(size_t buffer_size);
 
-// Updates a buffer with all new data, blocks until new data is available
-// Inputs:
-// data_log_buffer -> cyclic buffer where data will be written
-// buffer_size -> quantity of packages the buffer will store
-// current_idx -> newest value's index [in/out]
-// ticks_to_wait -> ticks to wait for data (suggested > pdMS_TO_TICKS(50))
-// Outputs:
-// ESP_OK -> buffer has been updated
-// ESP_ERR_TIMEOUT -> no data has been found in ticks_to_wait ticks. This may suggest the connection has been lost.
-// ESP_ERR_INVALID_STATE -> there has not been a connection with Mindrove Armband or mr_get_data_start() has not been called
-esp_err_t mr_wait_and_update_buffer(mr_data_log_t *data_log_buffer, uint32_t buffer_size, uint32_t *current_idx, TickType_t ticks_to_wait);
+// Writes the stored data onto a buffer
+// The first sample (idx 0) is the oldest one
+esp_err_t mr_get_data (mr_data_log_t * buffer);
 
 // Gets battery status
 esp_err_t mr_get_batt_status (uint8_t *out_battery_level);
