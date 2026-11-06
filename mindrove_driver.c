@@ -65,6 +65,14 @@ static uint8_t mr_battery;
 // Disconnect from wifi request
 static volatile bool mr_disconnect_requested = false;
 
+// Create event handlers
+static esp_event_handler_instance_t instance_any_id;
+static esp_event_handler_instance_t instance_got_ip;
+
+static esp_netif_t *mr_netif = NULL;
+
+static bool mr_this_driver_initialized_wifi = false;
+
 // Auxiliary definitions
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -131,10 +139,6 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
             return ret;
         }
 
-        // Create event handlers
-        static esp_event_handler_instance_t instance_any_id;
-        static esp_event_handler_instance_t instance_got_ip;
-
         esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id);
         esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip);
 
@@ -170,15 +174,26 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
     // Check whether wifi has been initialized and in what mode
     if (ret == ESP_ERR_WIFI_NOT_INIT) {
         // Initialize wifi
-        esp_netif_create_default_wifi_sta();
+        mr_netif = esp_netif_create_default_wifi_sta();
+        if (mr_netif == NULL)
+        {
+            ESP_LOGE(TAG, "Net infraestructure for station could not be created.");
+            return ESP_ERR_WIFI_INIT_STATE;
+        }
         wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_RETURN_ON_ERROR(esp_wifi_init(&wifi_cfg), TAG, "Error initializing wifi.");
+         mr_this_driver_initialized_wifi = true;
 
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Error setting wifi's station mode.");
 
     } else if (wifi_mode == WIFI_MODE_APSTA || wifi_mode == WIFI_MODE_AP) {
         if (wifi_mode == WIFI_MODE_AP) {
-            esp_netif_create_default_wifi_sta();
+            mr_netif = esp_netif_create_default_wifi_sta();
+            if (mr_netif == NULL)
+            {
+                ESP_LOGE(TAG, "Net infraestructure for station could not be created.");
+                return ESP_ERR_WIFI_INIT_STATE;
+            }
         }
         ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), TAG, "Error disconnecting to wifi");
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "Error setting wifi on AP/station mode.");
