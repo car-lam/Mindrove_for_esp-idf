@@ -1,3 +1,7 @@
+// ESP-IDF driver for the MindRove Armband (WiFi + UDP stream).
+// Independent project, not affiliated with or endorsed by MindRove Kft.
+// SPDX-License-Identifier: MIT
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>

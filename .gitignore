@@ -1,0 +1,10 @@
+# Build output and editor/tooling caches
+build/
+.cache/
+.vscode/
+.zed/
+.clangd
+compile_commands.json
+
+# Never commit WiFi credentials
+secrets.h

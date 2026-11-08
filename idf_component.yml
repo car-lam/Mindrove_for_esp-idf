@@ -1,0 +1,11 @@
+version: "0.1.0"
+description: "Unofficial ESP-IDF driver for the MindRove Armband: WiFi connection and EMG + IMU UDP stream decoding"
+license: "MIT"
+tags:
+  - emg
+  - imu
+  - wifi
+  - udp
+  - mindrove
+dependencies:
+  idf: ">=6.1"
