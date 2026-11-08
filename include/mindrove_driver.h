@@ -42,6 +42,12 @@ esp_err_t mr_get_data (mr_data_log_t * buffer);
 esp_err_t mr_get_batt_status (uint8_t *out_battery_level);
 
 // Terminates connection with mindrove
+// Stops data acquisition, frees its resources and leaves the wifi as it was before mr_connect():
+//  - if the driver initialized the wifi, it stops and deinitializes it
+//  - if the wifi was already in use, it restores the previous mode and station config (but does not reconnect)
+// Safe to call more than once, or without mr_connect(). Also call it if mr_connect() failed.
+// Returns ESP_ERR_TIMEOUT if the acquisition tasks did not stop; in that case nothing is released and it can be
+// called again.
 esp_err_t mr_connection_end (void);
 
 #endif

@@ -41,8 +41,17 @@ static bool mr_netif_done = false;
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group = NULL;
 
-// Temporal variable for checking esp_err_t returns
-static esp_err_t ret;
+// Wifi state found by mr_connect() when the wifi had already been initialized by someone else.
+// mr_connection_end() restores it.
+static bool mr_prev_mode_saved = false;
+static wifi_mode_t mr_prev_mode = WIFI_MODE_NULL;
+static bool mr_prev_sta_cfg_saved = false;
+static wifi_config_t mr_prev_sta_cfg;
+
+// UDP receive timeout. Short so the UDP task notices a stop request quickly.
+#define MR_UDP_RCV_TIMEOUT_MS 300
+// Consecutive receive timeouts before warning that no data arrives (~5 s)
+#define MR_UDP_NO_DATA_WARN_COUNT (5000 / MR_UDP_RCV_TIMEOUT_MS)
 
 // Flag for mindrove connection configuration done
 static bool mr_config_for_mr_done = false;
@@ -112,6 +121,8 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
     // Event bits
     EventBits_t bits;
 
+    esp_err_t ret;
+
     // Check correct args
     if (mr_wifi_ssid == NULL || mr_wifi_pass == NULL) {
         ESP_LOGE(TAG, "SSID or Password empty.");
@@ -148,8 +159,18 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
             return ret;
         }
 
-        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id);
-        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip);
+        ESP_RETURN_ON_ERROR(
+            esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id),
+            TAG, "Error registering wifi event handler.");
+
+        ret = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL,
+                                                  &instance_got_ip);
+        if (ret != ESP_OK) {
+            // Undo the first registration so a later retry does not register it twice
+            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id);
+            ESP_LOGE(TAG, "Error registering IP event handler.");
+            return ret;
+        }
 
         mr_netif_done = true;
     }
@@ -194,20 +215,41 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
 
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Error setting wifi's station mode.");
 
-    } else if (wifi_mode == WIFI_MODE_APSTA || wifi_mode == WIFI_MODE_AP) {
+    } else if (ret != ESP_OK) {
+        // wifi_mode is not valid here
+        ESP_LOGE(TAG, "Error reading wifi mode.");
+        return ret;
+
+    } else {
+        // Wifi belongs to someone else: save its state so mr_connection_end() can restore it
+        mr_prev_mode = wifi_mode;
+        mr_prev_mode_saved = true;
+
+        if (wifi_mode == WIFI_MODE_STA || wifi_mode == WIFI_MODE_APSTA) {
+            if (esp_wifi_get_config(WIFI_IF_STA, &mr_prev_sta_cfg) == ESP_OK) {
+                mr_prev_sta_cfg_saved = true;
+            }
+        }
+
         if (wifi_mode == WIFI_MODE_AP) {
+            // There is no station interface yet: the driver creates it (and destroys it in mr_connection_end())
             mr_netif = esp_netif_create_default_wifi_sta();
             if (mr_netif == NULL) {
                 ESP_LOGE(TAG, "Net infraestructure for station could not be created.");
                 return ESP_ERR_NO_MEM;
             }
         }
-        ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), TAG, "Error disconnecting to wifi");
-        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "Error setting wifi on AP/station mode.");
 
-    } else {
-        ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), TAG, "Error disconnecting to wifi");
-        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Error setting wifi's station mode.");
+        // Not started yet is fine: there is nothing to disconnect from
+        ret = esp_wifi_disconnect();
+        if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_STARTED) {
+            ESP_LOGE(TAG, "Error disconnecting from wifi.");
+            return ret;
+        }
+
+        wifi_mode_t new_mode = (wifi_mode == WIFI_MODE_AP || wifi_mode == WIFI_MODE_APSTA) ? WIFI_MODE_APSTA
+                                                                                           : WIFI_MODE_STA;
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(new_mode), TAG, "Error setting wifi mode.");
     }
 
     strcpy((char *)wifi_config.sta.ssid, mr_wifi_ssid);
@@ -231,7 +273,7 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
 }
 
 // Task Handle
-TaskHandle_t udp_client_handle;
+static TaskHandle_t udp_client_handle = NULL;
 
 static void udp_client_task(void *pvParameters)
 {
@@ -243,19 +285,19 @@ static void udp_client_task(void *pvParameters)
     mr_sockaddr.sin_family = AF_INET;
     mr_sockaddr.sin_port = htons(MR_UDP_PORT);
 
-    while (1) {
+    while (!mr_stop_requested) {
 
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
 
         if (sock < 0) {
-            ESP_LOGE(TAG, "Socket could not be created.");
+            ESP_LOGE(TAG, "Socket could not be created: errno %d", errno);
             break;
         }
 
         // Set timeout
         struct timeval timeout;
         timeout.tv_sec = 0;
-        timeout.tv_usec = 300000;
+        timeout.tv_usec = MR_UDP_RCV_TIMEOUT_MS * 1000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
 
         // Bind
@@ -269,50 +311,48 @@ static void udp_client_task(void *pvParameters)
         // Loop for receiving data and writing it onto the buffer
         struct sockaddr_storage source_addr;
         socklen_t socklen = sizeof(source_addr);
+        int n_timeouts = 0;
 
-        while (1) {
+        while (!mr_stop_requested) {
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
             if (len < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    ESP_LOGW(TAG, "300 ms passed without receiving data. Waiting.");
+                    // Warn once every ~5 s without data, not on every timeout
+                    n_timeouts++;
+                    if (n_timeouts >= MR_UDP_NO_DATA_WARN_COUNT) {
+                        ESP_LOGW(TAG, "5 seconds passed without receiving data. Waiting.");
+                        n_timeouts = 0;
+                    }
                 } else {
-                    ESP_LOGE(TAG, "Socket error.");
+                    ESP_LOGE(TAG, "Socket error: errno %d", errno);
                     break;
                 }
             }
 
-            else if (len != MR_PKG_SIZE) {
-                ESP_LOGI(TAG, "Data is invalid.");
-            }
-
             else {
-                if (xQueueSend(mr_to_decode_queue, rx_buffer, pdMS_TO_TICKS(10)) != pdPASS) {
+                n_timeouts = 0;
+
+                if (len != MR_PKG_SIZE) {
+                    ESP_LOGI(TAG, "Data is invalid.");
+                } else if (xQueueSend(mr_to_decode_queue, rx_buffer, pdMS_TO_TICKS(10)) != pdPASS) {
                     ESP_LOGE(TAG, "The queue is full.");
                 }
             }
-
-            // Check if task finishing has been requested
-            if (mr_stop_requested)
-            {
-                break;
-            }
-        }
-
-        if (sock != -1) {
-            ESP_LOGE(TAG, "Shutting down socket and restarting...");
         }
 
         shutdown(sock, 0);
         close(sock);
 
-        // Check if task finishing has been requested
-        if (mr_stop_requested)
-        {
-            xEventGroupSetBits(mr_tasks_event_group, MR_UDP_TASK_DONE_BIT);
-            vTaskDelete(NULL);
+        if (!mr_stop_requested) {
+            ESP_LOGW(TAG, "Restarting socket...");
+            // Avoid a tight loop if the error persists
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 
+    // Single exit point: always tell mr_acquisition_teardown() that this task is done,
+    // whether it was asked to stop or it failed on its own
+    xEventGroupSetBits(mr_tasks_event_group, MR_UDP_TASK_DONE_BIT);
     vTaskDelete(NULL);
 }
 
@@ -364,50 +404,94 @@ static esp_err_t mr_decode(const uint8_t buf[128], mr_data_log_t *log)
 }
 
 // Task handle
-TaskHandle_t mr_decode_and_update_buffer_handle;
+static TaskHandle_t mr_decode_and_update_buffer_handle = NULL;
 static uint32_t mr_buffer_idx_head = 0;
 static bool mr_buffer_full = false;
 
 static void mr_decode_and_update_buffer(void *pvParameters)
 {
-    while (1) {
+    mr_data_log_t log;
+    uint8_t buf[128];
 
-        mr_data_log_t log;
-        uint8_t buf[128];
-        esp_err_t err;
-
-        while (1) {
-            if (xQueueReceive(mr_to_decode_queue, buf, pdMS_TO_TICKS(50))) {
-                err = mr_decode(buf, &log);
-                if (err == ESP_OK) {
-                    // Put data onto the internal buffer
-                    if (xSemaphoreTake(mr_buffer_mutex, pdMS_TO_TICKS(5))) {
-                        mr_buffer[mr_buffer_idx_head] = log;
-                        mr_buffer_idx_head++;
-                        if (mr_buffer_idx_head == mr_buffer_size) {
-                            mr_buffer_idx_head = 0;
-                            mr_buffer_full = true;
-                        }
-                        xSemaphoreGive(mr_buffer_mutex);
-                    }
+    while (!mr_stop_requested) {
+        // The 50 ms timeout lets the task check the stop request regularly
+        if (xQueueReceive(mr_to_decode_queue, buf, pdMS_TO_TICKS(50)) && mr_decode(buf, &log) == ESP_OK) {
+            // Put data onto the internal buffer
+            if (xSemaphoreTake(mr_buffer_mutex, pdMS_TO_TICKS(5))) {
+                mr_buffer[mr_buffer_idx_head] = log;
+                mr_buffer_idx_head++;
+                if (mr_buffer_idx_head == mr_buffer_size) {
+                    mr_buffer_idx_head = 0;
+                    mr_buffer_full = true;
                 }
-            }
-
-            // Check if task finishing has been requested
-            if (mr_stop_requested)
-            {
-                xEventGroupSetBits(mr_tasks_event_group, MR_DECODE_TASK_DONE_BIT);
-                vTaskDelete(NULL);
+                xSemaphoreGive(mr_buffer_mutex);
             }
         }
     }
+
+    // Single exit point
+    xEventGroupSetBits(mr_tasks_event_group, MR_DECODE_TASK_DONE_BIT);
+    vTaskDelete(NULL);
+}
+
+// Stops the acquisition tasks (if running) and frees the resources they share.
+// Safe to call more than once. If a task does not stop in time nothing is freed,
+// because that task may still be using the queue, mutex or buffer.
+static esp_err_t mr_acquisition_teardown(void)
+{
+    // Wait only for the tasks that actually exist
+    EventBits_t wait_bits = 0;
+    if (udp_client_handle != NULL) {
+        wait_bits |= MR_UDP_TASK_DONE_BIT;
+    }
+    if (mr_decode_and_update_buffer_handle != NULL) {
+        wait_bits |= MR_DECODE_TASK_DONE_BIT;
+    }
+
+    if (wait_bits != 0) {
+        mr_stop_requested = true;
+
+        EventBits_t bits = xEventGroupWaitBits(mr_tasks_event_group, wait_bits, pdTRUE, pdTRUE,
+                                               pdMS_TO_TICKS(2000)); // > SO_RCVTIMEO
+
+        if ((bits & wait_bits) != wait_bits) {
+            ESP_LOGE(TAG, "Tasks did not stop in time, resources not freed.");
+            return ESP_ERR_TIMEOUT;
+        }
+
+        udp_client_handle = NULL;
+        mr_decode_and_update_buffer_handle = NULL;
+    }
+
+    // Free in reverse order of creation. The tasks' event group is kept (created once).
+    if (mr_to_decode_queue != NULL) {
+        vQueueDelete(mr_to_decode_queue);
+        mr_to_decode_queue = NULL;
+    }
+    if (mr_buffer_mutex != NULL) {
+        vSemaphoreDelete(mr_buffer_mutex);
+        mr_buffer_mutex = NULL;
+    }
+    if (mr_buffer != NULL) {
+        free(mr_buffer);
+        mr_buffer = NULL;
+    }
+
+    mr_buffer_idx_head = 0;
+    mr_buffer_full = false;
+    mr_buffer_size = 0;
+    mr_battery = 0;
+
+    return ESP_OK;
 }
 
 // Starts a task that gets data continuously
 // This function calls mr_get_data once the buffer is full so the user only works with complete buffers
 esp_err_t mr_get_data_start(size_t buffer_size)
 {
-    // 0. Check if connection has been stablished
+    esp_err_t err = ESP_OK;
+
+    // 0. Validations. Nothing has been created yet, so plain returns are fine here.
     if (s_wifi_event_group == NULL) {
         ESP_LOGE(TAG, "Wifi has not been initialized, run mr_connect() first.");
         return ESP_ERR_WIFI_NOT_CONNECT;
@@ -420,38 +504,77 @@ esp_err_t mr_get_data_start(size_t buffer_size)
         return ESP_ERR_WIFI_NOT_CONNECT;
     }
 
-    // 1. Set the internal buffer that will store the data
-    mr_buffer_size = buffer_size;
-    mr_buffer = heap_caps_malloc(mr_buffer_size * sizeof(*mr_buffer), MALLOC_CAP_8BIT);
+    if (buffer_size == 0) {
+        ESP_LOGE(TAG, "Buffer size must be greater than 0.");
+        return ESP_ERR_INVALID_ARG;
+    }
 
+    if (udp_client_handle != NULL || mr_decode_and_update_buffer_handle != NULL) {
+        ESP_LOGE(TAG, "Data acquisition already running, run mr_connection_end() first.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 1. Set the internal buffer that will store the data
+    mr_buffer = heap_caps_malloc(buffer_size * sizeof(*mr_buffer), MALLOC_CAP_8BIT);
     if (mr_buffer == NULL) {
         ESP_LOGE(TAG, "Error creating the internal buffer, it may not be sufficient memory on the heap.");
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
     }
 
     mr_buffer_mutex = xSemaphoreCreateMutex();
+    if (mr_buffer_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create the buffer mutex.");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
 
     // Create the queue in which the two tasks will comunicate
     mr_to_decode_queue = xQueueCreate(4, sizeof(uint8_t) * 128);
     if (mr_to_decode_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create the queue to store data to be decoded.");
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
     }
 
     if (mr_tasks_event_group == NULL) {
         mr_tasks_event_group = xEventGroupCreate();
         if (mr_tasks_event_group == NULL) {
-            return ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "Failed to create the tasks event group.");
+            err = ESP_ERR_NO_MEM;
+            goto cleanup;
         }
     }
+
+    // 2. Reset state before the tasks start using it
+    mr_buffer_size = buffer_size;
+    mr_buffer_idx_head = 0;
+    mr_buffer_full = false;
     xEventGroupClearBits(mr_tasks_event_group, MR_ALL_TASKS_DONE_BITS);
     mr_stop_requested = false;
 
-    xTaskCreate(udp_client_task, "udp_client_task", 4096, NULL, 5, &udp_client_handle);
-    xTaskCreate(mr_decode_and_update_buffer, "decode_and_update_buffer", 4096, NULL, 4,
-                &mr_decode_and_update_buffer_handle);
+    // 3. Create the tasks
+    if (xTaskCreate(udp_client_task, "udp_client_task", 4096, NULL, 5, &udp_client_handle) != pdPASS) {
+        udp_client_handle = NULL;
+        ESP_LOGE(TAG, "Failed to create the UDP client task.");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    if (xTaskCreate(mr_decode_and_update_buffer, "decode_and_update_buffer", 4096, NULL, 4,
+                    &mr_decode_and_update_buffer_handle) != pdPASS) {
+        mr_decode_and_update_buffer_handle = NULL;
+        ESP_LOGE(TAG, "Failed to create the decoding task.");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
 
     return ESP_OK;
+
+cleanup:
+    // Stops whatever task was created and frees whatever is not NULL
+    mr_acquisition_teardown();
+    return err;
 }
 
 // Writes the stored data onto a buffer
@@ -495,36 +618,85 @@ esp_err_t mr_get_batt_status(uint8_t *out_battery_level)
     return ESP_OK;
 }
 
+// Stores the first error found, so teardown can go on and still report what failed
+static void mr_keep_first_err(esp_err_t *first, esp_err_t e, const char *what)
+{
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "%s: %s", what, esp_err_to_name(e));
+        if (*first == ESP_OK) {
+            *first = e;
+        }
+    }
+}
+
 // Terminates connection with mindrove
 esp_err_t mr_connection_end(void)
 {
-    esp_err_t err = ESP_OK;
-
-    if (mr_decode_and_update_buffer_handle != NULL && udp_client_handle != NULL)
-    {
-        mr_stop_requested = true;
-
-        // Stop tasks
-        EventBits_t bits = xEventGroupWaitBits(mr_tasks_event_group,
-                                               MR_ALL_TASKS_DONE_BITS,
-                                               pdTRUE,   // limpiar los bits al salir
-                                               pdTRUE,   // esperar a TODOS (AND), no a cualquiera
-                                               pdMS_TO_TICKS(2000)); // > SO_RCVTIMEO
-
-        if ((bits & MR_ALL_TASKS_DONE_BITS) != MR_ALL_TASKS_DONE_BITS) {
-            // Alguna tarea no terminó: NO liberes la cola/buffer/mutex
-            ESP_LOGE(TAG, "Tasks did not stop in time.");
-            err = ESP_ERR_TIMEOUT;
-        }
-
-        mr_decode_and_update_buffer_handle = NULL;
-        udp_client_handle = NULL;
+    // 1. Stop tasks and free acquisition resources.
+    // If a task is still alive, leave the network untouched: it may still be using the socket.
+    // The user can call mr_connection_end() again.
+    esp_err_t err = mr_acquisition_teardown();
+    if (err != ESP_OK) {
+        return err;
     }
 
-    mr_disconnect_requested = true;
-    // Delete wifi connection
-    ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), TAG, "Error disconnecting from wifi.");
-    ESP_RETURN_ON_ERROR(esp_wifi_stop(), TAG, "Error stoping wifi.");
+    // 2. Nothing to do if mr_connect() never got this far (or mr_connection_end() already ran)
+    if (!mr_netif_done) {
+        return ESP_OK;
+    }
 
+    esp_err_t e;
+
+    // 3. Disconnect. The flag keeps the event handler from reconnecting.
+    mr_disconnect_requested = true;
+    e = esp_wifi_disconnect();
+    if (e != ESP_ERR_WIFI_NOT_STARTED && e != ESP_ERR_WIFI_NOT_INIT) {
+        mr_keep_first_err(&err, e, "Error disconnecting from wifi");
+    }
+
+    // 4. Remove the event handlers. From here on nobody clears the connected bit, so do it by hand.
+    mr_keep_first_err(&err, esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id),
+                      "Error unregistering wifi event handler");
+    mr_keep_first_err(&err, esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip),
+                      "Error unregistering IP event handler");
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+    // 5. Leave the wifi as it was before mr_connect()
+    if (mr_this_driver_initialized_wifi) {
+        // The driver brought the wifi up, so it brings it down. Order matters: stop -> deinit -> netif.
+        e = esp_wifi_stop();
+        if (e != ESP_ERR_WIFI_NOT_INIT) {
+            mr_keep_first_err(&err, e, "Error stopping wifi");
+        }
+        e = esp_wifi_deinit();
+        if (e != ESP_ERR_WIFI_NOT_INIT) {
+            mr_keep_first_err(&err, e, "Error deinitializing wifi");
+        }
+    } else if (mr_prev_mode_saved) {
+        // The wifi belongs to someone else: give back its station config and mode, do not stop it.
+        // Its owner has to call esp_wifi_connect() again if it wants its previous network back.
+        if (mr_prev_sta_cfg_saved) {
+            mr_keep_first_err(&err, esp_wifi_set_config(WIFI_IF_STA, &mr_prev_sta_cfg),
+                              "Error restoring previous station config");
+        }
+        mr_keep_first_err(&err, esp_wifi_set_mode(mr_prev_mode), "Error restoring previous wifi mode");
+    }
+
+    // mr_netif is only non-NULL when this driver created it (wifi not initialized, or AP mode)
+    if (mr_netif != NULL) {
+        esp_netif_destroy_default_wifi(mr_netif);
+        mr_netif = NULL;
+    }
+
+    // 6. Back to the initial state, so the next mr_connect() starts from scratch
+    mr_config_for_mr_done = false;
+    mr_this_driver_initialized_wifi = false;
+    mr_prev_mode_saved = false;
+    mr_prev_sta_cfg_saved = false;
+    mr_netif_done = false;
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Connection with Mindrove ended.");
+    }
     return err;
 }
