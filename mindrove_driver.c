@@ -4,12 +4,12 @@
 
 #include "mindrove_driver.h"
 
-#include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -65,13 +65,23 @@ static uint8_t mr_battery;
 // Disconnect from wifi request
 static volatile bool mr_disconnect_requested = false;
 
-// Create event handlers
+// Stop tasks and events request
+static volatile bool mr_stop_requested = false;
+
+// Declare event handlers
 static esp_event_handler_instance_t instance_any_id;
 static esp_event_handler_instance_t instance_got_ip;
 
 static esp_netif_t *mr_netif = NULL;
 
 static bool mr_this_driver_initialized_wifi = false;
+
+// Task-finished bits
+#define MR_UDP_TASK_DONE_BIT    BIT0
+#define MR_DECODE_TASK_DONE_BIT BIT1
+#define MR_ALL_TASKS_DONE_BITS  (MR_UDP_TASK_DONE_BIT | MR_DECODE_TASK_DONE_BIT)
+
+static EventGroupHandle_t mr_tasks_event_group = NULL;
 
 // Auxiliary definitions
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -83,8 +93,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "Disconnected, reason=%d", ev->reason);
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        if (!mr_disconnect_requested)
-        {
+        if (!mr_disconnect_requested) {
             esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -175,24 +184,22 @@ esp_err_t mr_connect(const char *mr_wifi_ssid, const char *mr_wifi_pass, TickTyp
     if (ret == ESP_ERR_WIFI_NOT_INIT) {
         // Initialize wifi
         mr_netif = esp_netif_create_default_wifi_sta();
-        if (mr_netif == NULL)
-        {
+        if (mr_netif == NULL) {
             ESP_LOGE(TAG, "Net infraestructure for station could not be created.");
             return ESP_ERR_WIFI_INIT_STATE;
         }
         wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_RETURN_ON_ERROR(esp_wifi_init(&wifi_cfg), TAG, "Error initializing wifi.");
-         mr_this_driver_initialized_wifi = true;
+        mr_this_driver_initialized_wifi = true;
 
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Error setting wifi's station mode.");
 
     } else if (wifi_mode == WIFI_MODE_APSTA || wifi_mode == WIFI_MODE_AP) {
         if (wifi_mode == WIFI_MODE_AP) {
             mr_netif = esp_netif_create_default_wifi_sta();
-            if (mr_netif == NULL)
-            {
+            if (mr_netif == NULL) {
                 ESP_LOGE(TAG, "Net infraestructure for station could not be created.");
-                return ESP_ERR_WIFI_INIT_STATE;
+                return ESP_ERR_NO_MEM;
             }
         }
         ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), TAG, "Error disconnecting to wifi");
@@ -247,8 +254,8 @@ static void udp_client_task(void *pvParameters)
 
         // Set timeout
         struct timeval timeout;
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 300000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
 
         // Bind
@@ -267,7 +274,7 @@ static void udp_client_task(void *pvParameters)
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
             if (len < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    ESP_LOGW(TAG, "5 seconds passed without receiving data. Waiting.");
+                    ESP_LOGW(TAG, "300 ms passed without receiving data. Waiting.");
                 } else {
                     ESP_LOGE(TAG, "Socket error.");
                     break;
@@ -283,12 +290,26 @@ static void udp_client_task(void *pvParameters)
                     ESP_LOGE(TAG, "The queue is full.");
                 }
             }
+
+            // Check if task finishing has been requested
+            if (mr_stop_requested)
+            {
+                break;
+            }
         }
 
         if (sock != -1) {
             ESP_LOGE(TAG, "Shutting down socket and restarting...");
-            shutdown(sock, 0);
-            close(sock);
+        }
+
+        shutdown(sock, 0);
+        close(sock);
+
+        // Check if task finishing has been requested
+        if (mr_stop_requested)
+        {
+            xEventGroupSetBits(mr_tasks_event_group, MR_UDP_TASK_DONE_BIT);
+            vTaskDelete(NULL);
         }
     }
 
@@ -371,6 +392,13 @@ static void mr_decode_and_update_buffer(void *pvParameters)
                     }
                 }
             }
+
+            // Check if task finishing has been requested
+            if (mr_stop_requested)
+            {
+                xEventGroupSetBits(mr_tasks_event_group, MR_DECODE_TASK_DONE_BIT);
+                vTaskDelete(NULL);
+            }
         }
     }
 }
@@ -410,6 +438,15 @@ esp_err_t mr_get_data_start(size_t buffer_size)
         return ESP_ERR_NO_MEM;
     }
 
+    if (mr_tasks_event_group == NULL) {
+        mr_tasks_event_group = xEventGroupCreate();
+        if (mr_tasks_event_group == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xEventGroupClearBits(mr_tasks_event_group, MR_ALL_TASKS_DONE_BITS);
+    mr_stop_requested = false;
+
     xTaskCreate(udp_client_task, "udp_client_task", 4096, NULL, 5, &udp_client_handle);
     xTaskCreate(mr_decode_and_update_buffer, "decode_and_update_buffer", 4096, NULL, 4,
                 &mr_decode_and_update_buffer_handle);
@@ -419,42 +456,33 @@ esp_err_t mr_get_data_start(size_t buffer_size)
 
 // Writes the stored data onto a buffer
 // The first sample (idx 0) is the oldest one
-esp_err_t mr_get_data(mr_data_log_t *buffer){
-    if (buffer == NULL)
-    {
+esp_err_t mr_get_data(mr_data_log_t *buffer)
+{
+    if (buffer == NULL) {
         ESP_LOGE(TAG, "Buffer is NULL.");
         return ESP_ERR_INVALID_ARG;
     }
-    if (mr_buffer_mutex == NULL)
-    {
+    if (mr_buffer_mutex == NULL) {
         ESP_LOGE(TAG, "Run mr_get_data_start() first.");
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (xSemaphoreTake(mr_buffer_mutex, pdMS_TO_TICKS(10)))
-    {
-        if (!mr_buffer_full)
-        {
+    if (xSemaphoreTake(mr_buffer_mutex, pdMS_TO_TICKS(10))) {
+        if (!mr_buffer_full) {
             xSemaphoreGive(mr_buffer_mutex);
             ESP_LOGW(TAG, "Buffer not full.");
             return ESP_ERR_NOT_FINISHED;
         }
 
-        memcpy(buffer,
-            (mr_buffer + mr_buffer_idx_head),
-            (mr_buffer_size - mr_buffer_idx_head) * sizeof(mr_data_log_t));
+        memcpy(buffer, (mr_buffer + mr_buffer_idx_head), (mr_buffer_size - mr_buffer_idx_head) * sizeof(mr_data_log_t));
 
-        memcpy(buffer + mr_buffer_size - mr_buffer_idx_head,
-            (mr_buffer),
-            (mr_buffer_idx_head) * sizeof(mr_data_log_t));
+        memcpy(buffer + mr_buffer_size - mr_buffer_idx_head, (mr_buffer), (mr_buffer_idx_head) * sizeof(mr_data_log_t));
 
         xSemaphoreGive(mr_buffer_mutex);
 
         ESP_LOGI(TAG, "Buffer up-to-date");
         return ESP_OK;
-    }
-    else
-    {
+    } else {
         ESP_LOGW(TAG, "Buffer could not be updated. Possibly the mutex was taken.");
         return ESP_ERR_TIMEOUT;
     }
@@ -470,9 +498,33 @@ esp_err_t mr_get_batt_status(uint8_t *out_battery_level)
 // Terminates connection with mindrove
 esp_err_t mr_connection_end(void)
 {
+    esp_err_t err = ESP_OK;
+
+    if (mr_decode_and_update_buffer_handle != NULL && udp_client_handle != NULL)
+    {
+        mr_stop_requested = true;
+
+        // Stop tasks
+        EventBits_t bits = xEventGroupWaitBits(mr_tasks_event_group,
+                                               MR_ALL_TASKS_DONE_BITS,
+                                               pdTRUE,   // limpiar los bits al salir
+                                               pdTRUE,   // esperar a TODOS (AND), no a cualquiera
+                                               pdMS_TO_TICKS(2000)); // > SO_RCVTIMEO
+
+        if ((bits & MR_ALL_TASKS_DONE_BITS) != MR_ALL_TASKS_DONE_BITS) {
+            // Alguna tarea no terminó: NO liberes la cola/buffer/mutex
+            ESP_LOGE(TAG, "Tasks did not stop in time.");
+            err = ESP_ERR_TIMEOUT;
+        }
+
+        mr_decode_and_update_buffer_handle = NULL;
+        udp_client_handle = NULL;
+    }
+
     mr_disconnect_requested = true;
     // Delete wifi connection
     ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), TAG, "Error disconnecting from wifi.");
     ESP_RETURN_ON_ERROR(esp_wifi_stop(), TAG, "Error stoping wifi.");
-    return ESP_OK;
+
+    return err;
 }
