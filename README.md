@@ -8,8 +8,8 @@ gyroscope and battery level. No PC and no MindRove SDK are needed on the receivi
 > used only to identify the device this driver talks to.
 
 > **Status:** the API is complete and compiles cleanly with `-Wall -Werror` on ESP-IDF v6.1 (ESP32-S3).
-> The full connect → acquire → disconnect cycle is still being tested on hardware. Expect changes until
-> version 1.0.
+> Tested on hardware (ESP32-S3 + armband): it connects and receives about 250 packages/s, with about 0.4 %
+> of them lost. Expect changes until version 1.0.
 
 ## Warning: the armband has an ESP32 inside
 
