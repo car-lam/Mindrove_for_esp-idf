@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=6.1"
+  # The driver itself, from this repository
+  mindrove_driver:
+    path: ../../..

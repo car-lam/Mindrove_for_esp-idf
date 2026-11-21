@@ -1,0 +1,3 @@
+# Keep the target an ESP32-S3: the armband has a plain ESP32 inside, so esptool refuses to flash it
+# by mistake (see the warning in the top-level README).
+CONFIG_IDF_TARGET="esp32s3"

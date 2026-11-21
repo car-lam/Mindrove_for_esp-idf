@@ -11,6 +11,19 @@ gyroscope and battery level. No PC and no MindRove SDK are needed on the receivi
 > The full connect → acquire → disconnect cycle is still being tested on hardware. Expect changes until
 > version 1.0.
 
+## Warning: the armband has an ESP32 inside
+
+The MindRove Armband appears to be built around an ESP32. Over USB it shows up as a serial port, just
+like an ESP32 dev board, so `idf.py flash` or `esptool` can pick it by mistake. Flashing it would erase
+the MindRove firmware, and there is no public image to restore it with.
+
+- **Unplug the armband from your computer while you flash your ESP32.**
+- If you can't unplug it, check the port before flashing (`ls /dev/serial/by-id/` on Linux) and always
+  pass it explicitly with `-p`.
+- Keep your project's target set to your actual chip (e.g. `esp32s3`). If the target and the chip don't
+  match, esptool refuses to flash, and that has already saved an armband once. Be extra careful if your
+  board is a plain `esp32`, because then nothing will stop it.
+
 ## How it works
 
 The armband runs its own WPA2 access point (IP `192.168.4.1`). Once a client joins, the armband sends it
@@ -98,6 +111,9 @@ void app_main(void)
 
 Keep the WiFi credentials out of version control, for example in a `secrets.h` that is listed in
 `.gitignore`.
+
+A complete test app is in [`examples/basic_test`](examples/basic_test). It runs the full life cycle
+several times and checks every return value, and it can also stream every package to a PC over UART.
 
 ## API
 

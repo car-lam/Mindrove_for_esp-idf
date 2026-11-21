@@ -8,3 +8,9 @@ compile_commands.json
 
 # Never commit WiFi credentials
 secrets.h
+
+# Files generated when building the examples
+examples/*/sdkconfig
+examples/*/sdkconfig.old
+examples/*/dependencies.lock
+examples/*/managed_components/
