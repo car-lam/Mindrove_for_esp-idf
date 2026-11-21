@@ -28,6 +28,25 @@ The driver:
 The armband streams to a single client, so disconnect your PC (or any other device) from the armband's
 network before connecting the ESP32.
 
+### Internals
+
+The two acquisition tasks never share memory directly. Packets go through a FreeRTOS queue, and decoded
+data goes into a ring buffer protected by a mutex. `mr_connection_end` stops the tasks with a handshake:
+
+1. it sets a stop flag;
+2. both tasks check the flag in every loop iteration (at most every 300 ms and 50 ms respectively);
+3. each task sets its bit in an event group and deletes itself;
+4. `mr_connection_end` waits for both bits and only then frees the queue, mutex and buffer.
+
+![Tasks, IPC objects and stop handshake](docs/architecture.png)
+
+The same flow over time, from `mr_connect` to `mr_connection_end`:
+
+![Driver life cycle](docs/lifecycle.png)
+
+Diagram sources are in [`docs/`](docs). `architecture.dot` is rendered with Graphviz and `lifecycle.mmd`
+with the Mermaid CLI. The render commands are at the top of each file.
+
 ## Installation
 
 Clone or copy this repository into the `components/` folder of your ESP-IDF project:

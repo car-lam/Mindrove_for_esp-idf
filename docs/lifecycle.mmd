@@ -1,0 +1,45 @@
+%% Life cycle of mindrove_driver across tasks.
+%% Render: mmdc -i lifecycle.mmd -o lifecycle.svg -b white && mmdc -i lifecycle.mmd -o lifecycle.png -b white -s 2
+sequenceDiagram
+    autonumber
+    participant App as Application task
+    participant Evt as Event loop task
+    participant UDP as udp_client_task
+    participant Dec as decode task
+    participant Arb as Armband
+
+    rect rgba(127, 127, 127, 0.08)
+    Note over App,Arb: mr_connect()
+    App->>Evt: register handlers, esp_wifi_start()
+    Evt->>Arb: esp_wifi_connect() on STA_START
+    Arb-->>Evt: IP assigned (GOT_IP)
+    Evt-->>App: set WIFI_CONNECTED_BIT, mr_connect() returns
+    end
+
+    rect rgba(127, 127, 127, 0.08)
+    Note over App,Arb: mr_get_data_start(n)
+    Note right of App: allocate ring buffer,<br/>mutex and queue
+    App-)UDP: xTaskCreate(), prio 5
+    App-)Dec: xTaskCreate(), prio 4
+    end
+
+    loop every packet (~4 ms)
+        Arb-)UDP: UDP packet, 75 B
+        UDP-)Dec: xQueueSend()
+        Note right of Dec: mr_decode(), write<br/>ring buffer under mutex
+    end
+
+    rect rgba(127, 127, 127, 0.08)
+    Note over App,Arb: mr_get_data(buf)
+    Note right of App: copy ring buffer<br/>under mutex
+    end
+
+    rect rgba(127, 127, 127, 0.08)
+    Note over App,Arb: mr_connection_end()
+    Note right of App: mr_stop_requested = true
+    UDP-->>App: close socket, set UDP_DONE bit, vTaskDelete()
+    Dec-->>App: set DECODE_DONE bit, vTaskDelete()
+    Note right of App: free queue, mutex,<br/>ring buffer
+    App->>Evt: disconnect, unregister handlers
+    Note right of App: stop and deinit wifi,<br/>or restore previous state
+    end

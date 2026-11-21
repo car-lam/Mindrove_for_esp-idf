@@ -1,0 +1,72 @@
+// Internal architecture of mindrove_driver: FreeRTOS tasks, IPC objects and who talks to whom.
+// Render: dot -Tsvg architecture.dot -o architecture.svg && dot -Tpng -Gdpi=150 architecture.dot -o architecture.png
+digraph mindrove_driver {
+    graph [rankdir=TB, fontname="Helvetica", fontsize=13, nodesep=0.55, ranksep=1.0, pad=0.3,
+           newrank=true, bgcolor="white", splines=true];
+    node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", fillcolor="white", color="#555555"];
+    edge  [fontname="Helvetica", fontsize=10, color="#444444", fontcolor="#333333"];
+
+    // ---------- Row 1: data path ----------
+    ARB [group=c0, label="MindRove Armband\nWiFi AP 192.168.4.1", style="filled", fillcolor="#e8f5e9", color="#2e7d32"];
+
+    RECV [group=c1, fillcolor="#fff3e0", color="#ef6c00", label=<<b>udp_client_task</b><br/><font point-size="10">prio 5, 4 KB stack</font><br/><br/>recvfrom() on port 4210<br/>300 ms timeout<br/>keeps 75-byte packets>];
+
+    Q [group=cq, label="mr_to_decode_queue\n4 x 128 B", style="filled", fillcolor="#fffde7", color="#f9a825", peripheries=2];
+
+    DECODE [group=c2, fillcolor="#e3f2fd", color="#1565c0", label=<<b>mr_decode_and_update_buffer</b><br/><font point-size="10">prio 4, 4 KB stack</font><br/><br/>xQueueReceive() 50 ms<br/>mr_decode(): uV, g, deg/s>];
+
+    BUF [group=c3, label="mr_buffer\nring buffer, n packages\nguarded by mr_buffer_mutex", shape=cylinder, fillcolor="#fffde7", color="#f9a825"];
+
+    // ---------- Row 2: synchronization objects ----------
+    // Clusters break column alignment in dot, so the event loop task is shown as a titled node
+    HANDLER [group=c0, fillcolor="#e0f7fa", color="#00838f", label=<<b>ESP-IDF event loop task</b><br/><br/>event_handler()<br align="left"/>STA_START: esp_wifi_connect()<br align="left"/>STA_DISCONNECTED: clear bit, reconnect<br align="left"/>GOT_IP: set bit<br align="left"/>>];
+    WEG  [label="s_wifi_event_group\nWIFI_CONNECTED_BIT", shape=cylinder, fillcolor="#fffde7", color="#f9a825"];
+    STOP [group=cq, label="mr_stop_requested\nvolatile flag", fillcolor="#ffebee", color="#c62828"];
+    TEG  [group=c2, label="mr_tasks_event_group\nUDP_DONE, DECODE_DONE", shape=cylinder, fillcolor="#ffebee", color="#c62828"];
+
+    // ---------- Row 3: application API ----------
+    // Clusters break column alignment in dot: the application task is shown as a row label + purple nodes
+    APPLBL [shape=plaintext, style="", fontcolor="#6a1b9a", label=<<b>Application task</b><br/>(e.g. app_main)>];
+    node [fillcolor="#f3e5f5", color="#6a1b9a"];
+    CONN  [group=c0, label="mr_connect()"];
+    START [group=c1, label="mr_get_data_start(n)"];
+    END   [group=c2, label="mr_connection_end()"];
+    GET   [group=c3, label="mr_get_data(buf)"];
+    node [fillcolor="white", color="#555555"];
+
+    // ---------- Layout: rows and left-to-right order ----------
+    { rank=same; ARB; RECV; Q; DECODE; BUF; }
+    { rank=same; HANDLER; WEG; STOP; TEG; }
+    { rank=same; APPLBL; CONN; START; END; GET; }
+    ARB -> HANDLER -> CONN [style=invis, weight=10];
+    RECV -> START          [style=invis, weight=10];
+    Q -> STOP              [style=invis, weight=10];
+    DECODE -> TEG -> END   [style=invis, weight=10];
+    BUF -> GET             [style=invis, weight=10];
+    HANDLER -> WEG -> STOP -> TEG [style=invis];
+    APPLBL -> CONN -> START -> END -> GET [style=invis];
+
+    // ---------- Data path ----------
+    ARB -> RECV   [label="UDP, 75 B\n~250 packets/s", penwidth=2.2, color="#2e7d32"];
+    RECV -> Q     [label="xQueueSend()\n10 ms", penwidth=1.6];
+    Q -> DECODE   [penwidth=1.6];
+    DECODE -> BUF [label="take mutex 5 ms\nwrite at head", penwidth=1.6];
+    BUF -> GET    [label="take mutex 10 ms\ncopy oldest\nto newest", penwidth=1.6, constraint=false];
+
+    // ---------- WiFi connection ----------
+    HANDLER -> WEG  [label="set / clear", constraint=false];
+    HANDLER -> CONN [label="esp_wifi_start()", color="#00838f", fontcolor="#00838f", dir=back];
+    WEG -> CONN     [label="waits for IP", style=dashed, color="#00838f", fontcolor="#00838f", constraint=false];
+
+    // ---------- Task creation ----------
+    RECV -> START [label="xTaskCreate()", style=dashed, color="#6a1b9a", fontcolor="#6a1b9a", dir=back];
+    DECODE -> START [label="xTaskCreate()", style=dashed, color="#6a1b9a", fontcolor="#6a1b9a", dir=back];
+
+    // ---------- Stop handshake (numbered) ----------
+    STOP -> END [label="1: set true", color="#c62828", fontcolor="#c62828", dir=back];
+    RECV -> STOP [label="2: checked\nevery loop", style=dotted, color="#c62828", fontcolor="#c62828", dir=back];
+    DECODE -> STOP [label="2", style=dotted, color="#c62828", fontcolor="#c62828", dir=back];
+    RECV -> TEG    [label="3: set UDP_DONE,\nvTaskDelete()", color="#c62828", fontcolor="#c62828", constraint=false];
+    DECODE -> TEG  [label="3: set DECODE_DONE,\nvTaskDelete()", color="#c62828", fontcolor="#c62828", constraint=false];
+    TEG -> END     [label="4: wait up to 2 s, then\nfree queue, mutex, buffer", style=dashed, color="#c62828", fontcolor="#c62828", constraint=false];
+}
